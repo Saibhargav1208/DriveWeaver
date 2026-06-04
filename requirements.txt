@@ -1,0 +1,51 @@
+# Core Deep Learning
+torch>=2.0.0
+torchvision>=0.15.0
+pytorch-lightning>=2.0.0
+timm>=0.9.0
+
+# Configuration
+hydra-core>=1.3.0
+omegaconf>=2.3.0
+python-dotenv>=1.0.0
+
+# Data Processing
+numpy>=1.24.0
+opencv-python>=4.8.0
+Pillow>=10.0.0
+scikit-image>=0.21.0
+
+# nuScenes
+nuscenes-devkit>=1.1.0
+pyquaternion>=0.9.9
+
+# Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+plotly>=5.14.0
+wandb>=0.15.0
+
+# Video Processing
+av>=10.0.0
+ffmpeg-python>=0.2.0
+
+# VLM for ThinkJEPA (Phase 3)
+transformers>=4.35.0
+accelerate>=0.24.0
+sentencepiece>=0.1.99
+
+# Utilities
+tqdm>=4.65.0
+einops>=0.7.0
+tensorboard>=2.13.0
+pandas>=2.0.0
+scipy>=1.10.0
+
+# Development
+pytest>=7.3.0
+black>=23.3.0
+flake8>=6.0.0
+mypy>=1.3.0
+
+# VideoSAUR (will be installed separately from existing repository)
+# Assuming videosaur is available at /work/videosaur or similar

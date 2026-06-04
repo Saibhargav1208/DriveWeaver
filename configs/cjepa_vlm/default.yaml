@@ -1,0 +1,88 @@
+# C-JEPA + VLM Full Training Config
+# Joint training of world model with VLM guidance (FiLM injection)
+
+defaults:
+  - _self_
+
+data:
+  slots_path: /work/data/slots/nuscenes_slots_full.pkl
+  batch_size: 8
+  num_workers: 12          # Increased from 4 to fix GPU underutilization
+  pin_memory: true
+  temporal:
+    history_length: 4
+    future_length: 6
+    stride: 1
+    min_sequence_length: 10
+
+model:
+  slot_dim: 128
+  num_slots: 11
+  depth: 6
+  num_heads: 8
+  dim_head: 64
+  mlp_dim: 2048
+  dropout: 0.1
+  hidden_dim: 512
+  encoder:
+    num_layers: 6
+    feedforward_dim: 2048
+    activation: gelu
+    layer_norm_eps: 1e-6
+  decoder:
+    num_layers: 4
+    feedforward_dim: 2048
+    activation: gelu
+  positional_encoding:
+    temporal_encoding: learnable
+    max_temporal_len: 50
+
+masking:
+  enabled: true
+  strategy: object
+  object_mask:
+    probability: 1.0
+    mask_ratio: 0.3
+    min_masked_objects: 2
+    max_masked_objects: 4
+  temporal_mask:
+    probability: 0.0
+    mask_ratio: 0.0
+    min_masked_frames: 0
+    max_masked_frames: 0
+  future_mask:
+    probability: 0.0
+    mask_ratio: 0.0
+
+vlm_guidance:
+  enable: true
+  guidance_mode: film
+  vlm_dim: 3584                    # Qwen3-VL-2B decoder hidden dimension (CORRECTED from 2048)
+  guidance_hidden: 512
+  cache_dir: /work/data/vlm_cache/nuscenes/
+  use_random: false
+  random_tokens: 480
+
+cjepa_checkpoint: /work/checkpoints/cjepa/best_model.pth
+
+training:
+  optimizer: adamw
+  learning_rate: 1e-4              # base C-JEPA predictor LR
+  guidance_lr: 3e-4                # guidance modules LR (reduced from 1e-3 to prevent NaN)
+  weight_decay: 1e-4
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  gradient_clip: 1.0
+  mixed_precision: true
+  max_epochs: 50
+  save_frequency: 5
+  keep_last_n: 2                   # Keep last N checkpoints (saves disk space)
+  checkpoint_dir: /work/checkpoints/cjepa_vlm
+  scheduler:
+    type: cosine
+    min_lr: 1e-6
+    total_steps: 20000
+
+system:
+  seed: 42
+  cuda: true

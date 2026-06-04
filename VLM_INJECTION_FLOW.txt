@@ -1,0 +1,306 @@
+╔════════════════════════════════════════════════════════════════════════════╗
+║          DUAL-PATH VLM INJECTION INTO C-JEPA (Complete Flow)              ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│ STEP 1: VLM CACHE LOADING (Dataset)                                     │
+└──────────────────────────────────────────────────────────────────────────┘
+
+File: data/vlm_cache/nuscenes/scene-0001.npz
+├── vlm_old: [4, 256, 3584]  ← VLM layers [6, 12, 18, 24]
+│   ├─ [0]: Layer 6  features [256, 3584]
+│   ├─ [1]: Layer 12 features [256, 3584]
+│   ├─ [2]: Layer 18 features [256, 3584]
+│   └─ [3]: Layer 24 features [256, 3584]
+│
+└── vlm_new: [4, 16, 3584]   ← Same layers, reasoning tokens
+    ├─ [0]: Layer 6  reasoning [16, 3584]
+    ├─ [1]: Layer 12 reasoning [16, 3584]
+    ├─ [2]: Layer 18 reasoning [16, 3584]
+    └─ [3]: Layer 24 reasoning [16, 3584]
+
+     ↓ Dataset.__getitem__() returns dict
+
+vlm_features = {
+    'old': Tensor[4, 256, 3584],
+    'new': Tensor[4, 16, 3584]
+}
+
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│ STEP 2: BATCHING (Collate Function)                                     │
+└──────────────────────────────────────────────────────────────────────────┘
+
+Batch of B=8 samples:
+
+vlm_features = {
+    'old': [8, 4, 256, 3584],   ← Stacked old features
+    'new': [8, 4, 16, 3584]     ← Stacked new features
+}
+           │   │   │     │
+           │   │   │     └─ VLM hidden dimension (Qwen3-VL-2B)
+           │   │   └─ Number of tokens (old=256 input, new=16 reasoning)
+           │   └─ VLM pyramid layers (4 depth levels)
+           └─ Batch size
+
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│ STEP 3: PROJECTION & COMBINATION (_prepare_guidance)                    │
+└──────────────────────────────────────────────────────────────────────────┘
+
+For each VLM layer i ∈ [0, 1, 2, 3]:
+
+    vlm_old[:, i, :, :]  → [8, 256, 3584]
+          ↓ proj_old: Linear(3584 → 512)
+    old_proj → [8, 256, 512]
+
+    vlm_new[:, i, :, :]  → [8, 16, 3584]
+          ↓ proj_new: Linear(3584 → 512)
+    new_proj → [8, 16, 512]
+
+    Combined → concat([old_proj, new_proj], dim=1) → [8, 272, 512]
+                                                           │
+                                           256 input + 16 reasoning tokens
+
+Result: List of 4 tensors (one per VLM layer)
+guidance_tokens_list = [
+    [8, 272, 512],  # VLM Layer 0 (decoder layer 6)
+    [8, 272, 512],  # VLM Layer 1 (decoder layer 12)
+    [8, 272, 512],  # VLM Layer 2 (decoder layer 18)
+    [8, 272, 512],  # VLM Layer 3 (decoder layer 24)
+]
+
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│ STEP 4: LAYER MAPPING (Map VLM layers → C-JEPA layers)                  │
+└──────────────────────────────────────────────────────────────────────────┘
+
+If C-JEPA has depth=6 but VLM has 4 layers:
+
+VLM Layer 0 (shallow) ───→ C-JEPA Layer 0 (early processing)
+VLM Layer 1 (mid-low) ───→ C-JEPA Layer 1
+VLM Layer 2 (mid-high) ──→ C-JEPA Layer 2
+VLM Layer 3 (deep) ──────→ C-JEPA Layer 3
+VLM Layer 3 (repeat) ────→ C-JEPA Layer 4
+VLM Layer 3 (repeat) ────→ C-JEPA Layer 5 (final)
+
+guidance_per_cjepa_layer = [
+    [8, 272, 512],  # C-JEPA layer 0 ← VLM layer 0
+    [8, 272, 512],  # C-JEPA layer 1 ← VLM layer 1
+    [8, 272, 512],  # C-JEPA layer 2 ← VLM layer 2
+    [8, 272, 512],  # C-JEPA layer 3 ← VLM layer 3
+    [8, 272, 512],  # C-JEPA layer 4 ← VLM layer 3 (repeated)
+    [8, 272, 512],  # C-JEPA layer 5 ← VLM layer 3 (repeated)
+]
+
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│ STEP 5: C-JEPA FORWARD PASS (with per-layer VLM injection)              │
+└──────────────────────────────────────────────────────────────────────────┘
+
+Input: history_slots [8, 4, 11, 128]  ← 4 frames, 11 slots, 128-dim
+                                         (from VideoSAUR)
+
+     ↓ ID Projection + Masking
+
+x_flat = [8, 44, 512]  ← 4 frames × 11 slots, flattened
+                         (44 tokens, 512 predictor dim)
+
+     ↓ Enter Transformer
+
+
+╔══════════════════════════════════════════════════════════════════════════╗
+║                   C-JEPA TRANSFORMER (6 layers)                          ║
+╚══════════════════════════════════════════════════════════════════════════╝
+
+┌─ C-JEPA Layer 0 ──────────────────────────────────────────────────────┐
+│                                                                         │
+│  x = [8, 44, 512]  ← Slot tokens                                       │
+│  guidance_0 = [8, 272, 512]  ← VLM Layer 0 (shallow semantic)          │
+│                                                                         │
+│  ┌───────────────────────────────────────────────────────────────┐    │
+│  │ FiLM Injection:                                               │    │
+│  │                                                               │    │
+│  │  1. Pool guidance: guidance_pooled = mean(guidance_0, dim=1) │    │
+│  │     → [8, 512]                                                │    │
+│  │                                                               │    │
+│  │  2. Generate FiLM params:                                     │    │
+│  │     sig = [pooled, pooled, abs(pooled), pooled²] → [8, 2048] │    │
+│  │     scale, shift = MLP(sig) → [8, 512] each                  │    │
+│  │                                                               │    │
+│  │  3. Modulate slots:                                           │    │
+│  │     x = x * (1 + scale) + shift                              │    │
+│  │     ↓                                                         │    │
+│  │     Semantically guided by VLM's shallow understanding       │    │
+│  └───────────────────────────────────────────────────────────────┘    │
+│                                                                         │
+│  x → Self-Attention(x, x, x) → x + residual                            │
+│  x → FFN(x) → x + residual                                             │
+│                                                                         │
+│  Output: x = [8, 44, 512]  (modulated by VLM Layer 0)                  │
+└─────────────────────────────────────────────────────────────────────────┘
+
+     ↓
+
+┌─ C-JEPA Layer 1 ──────────────────────────────────────────────────────┐
+│                                                                         │
+│  x = [8, 44, 512]                                                       │
+│  guidance_1 = [8, 272, 512]  ← VLM Layer 1 (mid-level reasoning)       │
+│                                                                         │
+│  ┌───────────────────────────────────────────────────────────────┐    │
+│  │ FiLM Injection (VLM Layer 1):                                 │    │
+│  │   → Adds mid-level semantic understanding                     │    │
+│  │   → Objects, relations, motion patterns                       │    │
+│  └───────────────────────────────────────────────────────────────┘    │
+│                                                                         │
+│  x → Self-Attention → FFN → x                                           │
+│  Output: x = [8, 44, 512]  (now has shallow + mid semantics)           │
+└─────────────────────────────────────────────────────────────────────────┘
+
+     ↓
+
+┌─ C-JEPA Layer 2 ──────────────────────────────────────────────────────┐
+│                                                                         │
+│  guidance_2 = [8, 272, 512]  ← VLM Layer 2 (high-level structure)      │
+│                                                                         │
+│  ┌───────────────────────────────────────────────────────────────┐    │
+│  │ FiLM Injection (VLM Layer 2):                                 │    │
+│  │   → Scene structure, spatial layout                           │    │
+│  │   → Road geometry, traffic context                            │    │
+│  └───────────────────────────────────────────────────────────────┘    │
+│                                                                         │
+│  x → Self-Attention → FFN → x                                           │
+└─────────────────────────────────────────────────────────────────────────┘
+
+     ↓
+
+┌─ C-JEPA Layer 3 ──────────────────────────────────────────────────────┐
+│                                                                         │
+│  guidance_3 = [8, 272, 512]  ← VLM Layer 3 (abstract intent)           │
+│                                                                         │
+│  ┌───────────────────────────────────────────────────────────────┐    │
+│  │ FiLM Injection (VLM Layer 3):                                 │    │
+│  │   → High-level planning, intent prediction                    │    │
+│  │   → "Vehicle will likely turn left"                           │    │
+│  └───────────────────────────────────────────────────────────────┘    │
+│                                                                         │
+│  x → Self-Attention → FFN → x                                           │
+└─────────────────────────────────────────────────────────────────────────┘
+
+     ↓
+
+┌─ C-JEPA Layers 4-5 ───────────────────────────────────────────────────┐
+│  (Use repeated VLM Layer 3 guidance for consistency)                   │
+└─────────────────────────────────────────────────────────────────────────┘
+
+     ↓
+
+Output: x = [8, 44, 512]  ← Fully semantically guided predictions
+
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│ STEP 6: DECODE TO SLOTS                                                 │
+└──────────────────────────────────────────────────────────────────────────┘
+
+x = [8, 44, 512]  → reshape → [8, 10, 11, 512]
+                                 │   │   └─ 512-dim features
+                                 │   └─ 11 slots per frame
+                                 └─ 10 frames (4 history + 6 future)
+
+     ↓ Output projection
+
+predicted_slots = [8, 10, 11, 128]  ← Back to 128-dim slot space
+
+
+╔════════════════════════════════════════════════════════════════════════════╗
+║                           KEY INSIGHTS                                     ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+1. HIERARCHICAL GUIDANCE
+   ┌─────────────────────────────────────────────────────────────┐
+   │ VLM Layer 0 → C-JEPA Layer 0: Low-level visual features    │
+   │ VLM Layer 1 → C-JEPA Layer 1: Mid-level objects/motion     │
+   │ VLM Layer 2 → C-JEPA Layer 2: High-level scene structure   │
+   │ VLM Layer 3 → C-JEPA Layer 3: Abstract intent/planning     │
+   └─────────────────────────────────────────────────────────────┘
+
+   Each C-JEPA layer receives guidance at the CORRESPONDING semantic depth!
+
+2. DUAL-PATH PER LAYER
+   ┌─────────────────────────────────────────────────────────────┐
+   │ For each layer:                                             │
+   │   • vlm_old[i]: What VLM sees/understands (256 tokens)      │
+   │   • vlm_new[i]: What VLM predicts will happen (16 tokens)   │
+   │   • Combined: Input understanding + Reasoning (272 tokens)  │
+   └─────────────────────────────────────────────────────────────┘
+
+3. PER-LAYER FiLM
+   ┌─────────────────────────────────────────────────────────────┐
+   │ At each C-JEPA layer:                                       │
+   │   1. Get guidance for this specific depth                   │
+   │   2. Pool guidance tokens → [B, 512]                        │
+   │   3. Generate scale & shift via MLP                         │
+   │   4. Modulate slot features: x = x * (1+scale) + shift      │
+   └─────────────────────────────────────────────────────────────┘
+
+4. ZERO-INITIALIZED GATES
+   ┌─────────────────────────────────────────────────────────────┐
+   │ guidance_layer_scale = zeros(num_layers)                    │
+   │                                                             │
+   │ At initialization: gate = tanh(0) = 0                       │
+   │ → VLM guidance has NO effect (model = vanilla C-JEPA)       │
+   │                                                             │
+   │ During training: gates gradually open                       │
+   │ → VLM guidance smoothly increases influence                 │
+   └─────────────────────────────────────────────────────────────┘
+
+
+╔════════════════════════════════════════════════════════════════════════════╗
+║                    WHY THIS WORKS BETTER                                   ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+OLD (Ablation2_language):
+  ❌ Single flat array [2661, 2048]
+  ❌ Same guidance for all layers
+  ❌ No reasoning features (vlm_new)
+  ❌ Too many noisy tokens
+
+  Result: VLM was just NOISE → degraded performance
+
+NEW (Corrected):
+  ✅ Pyramid structure [4, 272, 3584]
+  ✅ Per-layer hierarchical guidance
+  ✅ Dual-path: understanding + reasoning
+  ✅ Efficient, semantically rich tokens
+
+  Result: VLM provides MEANINGFUL hierarchical semantic guidance
+          → Should significantly IMPROVE performance
+
+
+╔════════════════════════════════════════════════════════════════════════════╗
+║                         COMPLETE DATA FLOW                                 ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+nuScenes Video
+      ↓ VideoSAUR (frozen)
+Object Slots [T, 11, 128]
+      ↓
+CAM_FRONT Images
+      ↓ Qwen3-VL (offline)
+VLM Cache: vlm_old [4, 256, 3584] + vlm_new [4, 16, 3584]
+      ↓
+      ├─ vlm_old: Input understanding (what the VLM sees)
+      └─ vlm_new: Predictive reasoning (what the VLM thinks will happen)
+      ↓
+Project & Combine per layer → [4, 272, 512]
+      ↓
+Map to C-JEPA layers → [6, 272, 512]
+      ↓
+Inject into C-JEPA transformer (per-layer FiLM)
+      ↓
+Semantically-guided slot predictions [10, 11, 128]
+      ↓ Planner
+Trajectory prediction [T, 2]
+
+This is TRUE ThinkJEPA: Dual-path hierarchical semantic guidance!

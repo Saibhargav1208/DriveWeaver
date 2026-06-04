@@ -1,0 +1,162 @@
+# C-JEPA Temporal World Model Configuration
+# Phase 2: Object-centric latent prediction
+
+defaults:
+  - _self_
+
+# Data configuration
+data:
+  slots_path: /work/data/slots/nuscenes_slots_full.pkl
+  batch_size: 16
+  num_workers: 12          # Increased from 4 to fix GPU underutilization
+  pin_memory: true
+
+  # Temporal window configuration
+  temporal:
+    history_length: 4      # Number of history frames
+    future_length: 6       # Number of future frames to predict
+    stride: 1              # Sliding window stride
+    min_sequence_length: 10  # Minimum scene length (hist + future)
+
+  # Data augmentation
+  augmentation:
+    temporal_jitter: 0.1   # Random temporal offset
+    slot_dropout: 0.1      # Random slot dropout probability
+
+# Model architecture (C-JEPA Original)
+model:
+  # Input dimensions (from Phase 1 VideoSAUR)
+  slot_dim: 128            # VideoSAUR slot dimension
+  num_slots: 11            # Number of object slots
+
+  # C-JEPA architecture
+  depth: 6                 # Transformer depth (single non-causal transformer)
+  num_heads: 8             # Multi-head attention heads
+  dim_head: 64             # Dimension per head (hidden_dim / num_heads)
+  mlp_dim: 2048            # MLP hidden dimension
+  dropout: 0.1             # Dropout probability
+
+  # Legacy fields (kept for compatibility)
+  hidden_dim: 512          # Not used in C-JEPA (slot_dim is used directly)
+  encoder:
+    num_layers: 6          # Maps to depth
+    feedforward_dim: 2048  # Maps to mlp_dim
+    activation: 'gelu'
+    layer_norm_eps: 1e-6
+  decoder:
+    num_layers: 4          # Not used (no separate decoder)
+    feedforward_dim: 2048
+    activation: 'gelu'
+  positional_encoding:
+    temporal_encoding: 'learnable'
+    max_temporal_len: 50
+
+# Masking strategy (C-JEPA: Object-level only)
+masking:
+  enabled: true
+  strategy: 'object'  # C-JEPA uses object-level masking only
+
+  # Object-level masking (C-JEPA approach)
+  object_mask:
+    probability: 1.0       # Always use object masking
+    mask_ratio: 0.3        # Ratio of objects to mask
+    min_masked_objects: 2  # Minimum number of objects to mask
+    max_masked_objects: 4  # Maximum number of objects to mask
+
+  # Temporal masking (not used in C-JEPA)
+  temporal_mask:
+    probability: 0.0
+    mask_ratio: 0.0
+    min_masked_frames: 0
+    max_masked_frames: 0
+
+  # Future masking (not used in C-JEPA)
+  future_mask:
+    probability: 0.0
+    mask_ratio: 0.0
+
+# Training configuration
+training:
+  # Optimization
+  optimizer: 'adamw'
+  learning_rate: 3e-4
+  weight_decay: 1e-4
+  betas: [0.9, 0.999]
+  eps: 1e-8
+
+  # Learning rate schedule
+  scheduler:
+    type: 'cosine'         # 'cosine', 'step', 'plateau'
+    warmup_steps: 1000
+    min_lr: 1e-6
+    total_steps: 50000
+
+  # Training loop
+  max_epochs: 100
+  gradient_clip: 1.0
+  accumulation_steps: 1    # Gradient accumulation
+
+  # Mixed precision
+  mixed_precision: true
+
+  # Checkpointing
+  checkpoint_dir: /work/checkpoints/cjepa
+  save_frequency: 5        # Save every N epochs
+  keep_last_n: 2           # Keep last N checkpoints (saves disk space)
+
+  # Logging
+  log_frequency: 50        # Log every N steps
+  val_frequency: 500       # Validate every N steps
+
+# Loss configuration
+loss:
+  # Primary loss
+  prediction_weight: 1.0   # Weight for future slot prediction loss
+
+  # Masked loss
+  masked_weight: 2.0       # Higher weight for masked predictions
+
+  # Regularization losses
+  temporal_smooth_weight: 0.1   # Temporal smoothness
+  diversity_weight: 0.05        # Slot diversity
+
+  # Loss type
+  loss_type: 'mse'         # 'mse', 'huber', 'l1'
+
+# Validation/Evaluation
+evaluation:
+  # Metrics to compute
+  metrics:
+    - 'mse'                # Mean squared error
+    - 'mae'                # Mean absolute error
+    - 'temporal_consistency'  # Slot consistency over time
+    - 'slot_diversity'     # Diversity across slots
+
+  # Rollout evaluation
+  rollout:
+    enabled: true
+    num_steps: 12          # Autoregressive rollout steps
+    visualize: true
+    num_visualizations: 4  # Number of rollout videos to save
+
+  # Save predictions
+  save_predictions: true
+  prediction_dir: /work/outputs/cjepa/predictions
+
+# System configuration
+system:
+  seed: 42
+  cuda: true
+  num_gpus: 1
+  distributed: false
+
+  # Performance
+  cudnn_benchmark: true
+  cudnn_deterministic: false
+
+# Experiment tracking
+experiment:
+  name: 'cjepa_baseline'
+  project: 'DriveWeaver'
+  tags: ['cjepa', 'phase2', 'latent-world-model']
+  notes: 'C-JEPA temporal predictor on VideoSAUR slots'

@@ -1,0 +1,37 @@
+# C-JEPA Debug Configuration
+# Fast iteration on small subset
+
+defaults:
+  - default
+  - _self_
+
+# Override for debugging
+data:
+  batch_size: 4
+  num_workers: 2
+
+model:
+  depth: 2              # Fewer layers for fast debugging
+  num_heads: 4
+  dim_head: 32          # 128 / 4
+  mlp_dim: 1024         # Smaller MLP
+  encoder:
+    num_layers: 2       # For compatibility
+    feedforward_dim: 1024
+  decoder:
+    num_layers: 2
+
+training:
+  max_epochs: 5         # Quick test
+  log_frequency: 10
+  val_frequency: 50
+  checkpoint_dir: /work/checkpoints/cjepa
+
+evaluation:
+  rollout:
+    num_steps: 4        # Shorter rollout
+    num_visualizations: 2
+
+experiment:
+  name: 'cjepa_debug'
+  tags: ['debug', 'cjepa']

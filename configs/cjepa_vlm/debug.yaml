@@ -1,0 +1,87 @@
+# C-JEPA + VLM Debug Config
+# Joint training of world model with VLM guidance injection
+
+defaults:
+  - _self_
+
+data:
+  slots_path: /work/data/slots/nuscenes_slots_debug.pkl
+  batch_size: 4
+  num_workers: 0
+  pin_memory: false
+  temporal:
+    history_length: 4
+    future_length: 6
+    stride: 1
+    min_sequence_length: 10
+
+model:
+  slot_dim: 128
+  num_slots: 11
+  depth: 2
+  num_heads: 4
+  dim_head: 32
+  mlp_dim: 1024
+  dropout: 0.0
+  hidden_dim: 128
+  encoder:
+    num_layers: 2
+    feedforward_dim: 1024
+    activation: gelu
+    layer_norm_eps: 1e-6
+  decoder:
+    num_layers: 2
+    feedforward_dim: 1024
+    activation: gelu
+  positional_encoding:
+    temporal_encoding: learnable
+    max_temporal_len: 50
+
+masking:
+  enabled: true
+  strategy: object
+  object_mask:
+    probability: 1.0
+    mask_ratio: 0.3
+    min_masked_objects: 2
+    max_masked_objects: 4
+  temporal_mask:
+    probability: 0.0
+    mask_ratio: 0.0
+    min_masked_frames: 0
+    max_masked_frames: 0
+  future_mask:
+    probability: 0.0
+    mask_ratio: 0.0
+
+vlm_guidance:
+  enable: true
+  guidance_mode: film
+  vlm_dim: 512
+  guidance_hidden: 256
+  cache_dir: null
+  use_random: true
+  random_tokens: 64
+
+cjepa_checkpoint: /work/checkpoints/cjepa/best_model.pth
+
+training:
+  optimizer: adamw
+  learning_rate: 1e-4
+  guidance_lr: 1e-3
+  weight_decay: 1e-4
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  gradient_clip: 1.0
+  mixed_precision: false
+  max_epochs: 5
+  save_frequency: 1
+  checkpoint_dir: /work/checkpoints/cjepa_vlm
+  scheduler:
+    type: cosine
+    min_lr: 1e-6
+    total_steps: 200
+
+system:
+  seed: 42
+  cuda: true
