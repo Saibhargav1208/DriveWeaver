@@ -16,7 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 import numpy as np
-from typing import Tuple, Optional, Dict, List
+from typing import Tuple, Optional, Dict, List, Union
 from omegaconf import DictConfig
 
 
@@ -71,7 +71,8 @@ class NonCausalTransformer(nn.Module):
             self.guidance_proj_old = nn.Linear(guidance_dim, dim, bias=False)
             self.guidance_proj_new = nn.Linear(guidance_dim, dim, bias=False)
 
-            # Initialize new projector to near-zero for smooth warmup
+            # Initialize both projectors to near-zero for smooth warmup and stability
+            nn.init.normal_(self.guidance_proj_old.weight, std=0.01)
             nn.init.normal_(self.guidance_proj_new.weight, std=0.01)
 
             if guidance_mode in ("film", "adaln"):
@@ -84,6 +85,11 @@ class NonCausalTransformer(nn.Module):
                     )
                     for _ in range(depth)
                 ])
+                # Initialize final layer of fusion MLPs to near-zero for stability
+                for mlp in self.guidance_fusion_mlps:
+                    nn.init.normal_(mlp[-1].weight, std=0.01)
+                    if mlp[-1].bias is not None:
+                        nn.init.zeros_(mlp[-1].bias)
                 if guidance_mode == "adaln":
                     self.guidance_prenorms = nn.ModuleList([
                         nn.LayerNorm(dim) for _ in range(depth)
@@ -102,7 +108,8 @@ class NonCausalTransformer(nn.Module):
                     for _ in range(depth)
                 ])
 
-            # Per-layer gate initialized to zero — guidance has no effect at init
+            # Match ThinkJEPA: start from the unguided predictor and let training
+            # learn how much VLM guidance each layer should use.
             self.guidance_layer_scale = nn.Parameter(torch.zeros(depth, 1, 1))
 
     def _inject_guidance(
@@ -127,6 +134,11 @@ class NonCausalTransformer(nn.Module):
 
         if self.guidance_mode == "crossattn":
             q = self.guidance_query_norms[layer_idx](x)
+            if isinstance(guidance_tokens, tuple):
+                memory_parts = [tokens for tokens in guidance_tokens if tokens is not None]
+                guidance_tokens = torch.cat(memory_parts, dim=1) if memory_parts else None
+            if guidance_tokens is None:
+                return x
             # Use mask as key_padding_mask (True = ignore)
             key_padding_mask = ~guidance_mask if guidance_mask is not None else None
             attn_out, _ = self.guidance_cross_attn[layer_idx](
@@ -135,29 +147,55 @@ class NonCausalTransformer(nn.Module):
             )
             return x + attn_out * gate
         else:
-            # FiLM / AdaLN: summarize guidance tokens -> scale & shift
-            if guidance_mask is not None:
-                # Masked average: sum valid tokens / count valid tokens
-                mask_expanded = guidance_mask.unsqueeze(-1).float()  # [B, S_vlm, 1]
-                masked_tokens = guidance_tokens * mask_expanded
-                summary = masked_tokens.sum(dim=1) / mask_expanded.sum(dim=1).clamp(min=1)  # [B, D]
+            # FiLM / AdaLN: ThinkJEPA-style dual-path summary.
+            # Official fusion signature: [old, new, |old-new|, old*new].
+            if isinstance(guidance_tokens, tuple):
+                old_tokens, new_tokens = guidance_tokens
+                old_summary = old_tokens.mean(dim=1) if old_tokens is not None else None
+                new_summary = new_tokens.mean(dim=1) if new_tokens is not None else None
+                if old_summary is None and new_summary is None:
+                    return x
+                if old_summary is None:
+                    old_summary = torch.zeros_like(new_summary)
+                if new_summary is None:
+                    new_summary = torch.zeros_like(old_summary)
             else:
-                summary = guidance_tokens.mean(dim=1)  # [B, dim]
+                if guidance_mask is not None:
+                    # Masked average: sum valid tokens / count valid tokens
+                    mask_expanded = guidance_mask.unsqueeze(-1).float()  # [B, S_vlm, 1]
+                    masked_tokens = guidance_tokens * mask_expanded
+                    old_summary = masked_tokens.sum(dim=1) / mask_expanded.sum(dim=1).clamp(min=1)
+                else:
+                    old_summary = guidance_tokens.mean(dim=1)  # [B, dim]
+                new_summary = torch.zeros_like(old_summary)
 
             sig = torch.cat([
-                summary,
-                summary,
-                summary.abs(),
-                summary * summary,
+                old_summary,
+                new_summary,
+                (old_summary - new_summary).abs(),
+                old_summary * new_summary,
             ], dim=-1)  # [B, 4*dim]
             scale_shift = self.guidance_fusion_mlps[layer_idx](sig)  # [B, 2*dim]
             scale, shift = scale_shift.chunk(2, dim=-1)  # each [B, dim]
+
+            # Clamp scale/shift to prevent NaN explosion
+            scale = torch.clamp(scale, min=-10.0, max=10.0)
+            shift = torch.clamp(shift, min=-10.0, max=10.0)
+
+            # Apply gate and reshape
             scale = (scale * gate).unsqueeze(1)  # [B, 1, dim]
             shift = (shift * gate).unsqueeze(1)
 
             if self.guidance_mode == "adaln":
                 x = self.guidance_prenorms[layer_idx](x)
-            return x * (1.0 + scale) + shift
+
+            # Apply FiLM with additional safety check
+            output = x * (1.0 + scale) + shift
+
+            # Safety: check for NaN/Inf and fall back to input if detected
+            if torch.isnan(output).any() or torch.isinf(output).any():
+                return x  # Fallback to unmodified input
+            return output
 
     def forward(
         self,
@@ -472,28 +510,45 @@ class CJEPAPredictor(nn.Module):
         if vlm_guidance is None or self.transformer.guidance_mode is None:
             return None, None, 0
 
-        vlm_old = vlm_guidance.get('old')  # [B, num_layers, S_old, vlm_dim]
+        vlm_old = vlm_guidance.get('old')  # [B, num_layers, S_old, vlm_dim] or [B, num_layers, 1, S_old, vlm_dim]
         vlm_new = vlm_guidance.get('new')  # [B, num_layers, S_new, vlm_dim] or None
+
+        # Backward compatibility for older callers/tests that pass a single
+        # tensor as {'vlm_features': [B, S, D] or [B, L, S, D]}.
+        if vlm_old is None and 'vlm_features' in vlm_guidance:
+            vlm_old = vlm_guidance['vlm_features']
+            if vlm_old.dim() == 3:
+                vlm_old = vlm_old.unsqueeze(1)
+            vlm_new = None
 
         if vlm_old is None:
             return None, None, 0
 
+        # Handle extra dimension from dataloader: [B, num_layers, 1, S_old, vlm_dim] → [B, num_layers, S_old, vlm_dim]
+        if vlm_old.dim() == 5 and vlm_old.shape[2] == 1:
+            vlm_old = vlm_old.squeeze(2)
+        if vlm_new is not None and vlm_new.dim() == 5 and vlm_new.shape[2] == 1:
+            vlm_new = vlm_new.squeeze(2)
+
         B, num_layers, S_old, vlm_dim = vlm_old.shape
 
-        # Project and combine per-layer
+        # Project per-layer VLM streams. Keep old/new separate for FiLM/AdaLN
+        # so fusion can use the ThinkJEPA signature [old, new, |old-new|, old*new].
         guidance_tokens_list = []
         for layer_idx in range(num_layers):
             old_layer = vlm_old[:, layer_idx, :, :]  # [B, S_old, vlm_dim]
             proj_old = self.transformer.guidance_proj_old(old_layer)  # [B, S_old, slot_dim]
 
+            proj_new = None
             if vlm_new is not None:
                 new_layer = vlm_new[:, layer_idx, :, :]  # [B, S_new, vlm_dim]
                 proj_new = self.transformer.guidance_proj_new(new_layer)  # [B, S_new, slot_dim]
-                combined = torch.cat([proj_old, proj_new], dim=1)  # [B, S_old+S_new, slot_dim]
-            else:
-                combined = proj_old
 
-            guidance_tokens_list.append(combined)
+            if self.transformer.guidance_mode == "crossattn":
+                parts = [proj_old] + ([proj_new] if proj_new is not None else [])
+                guidance_tokens_list.append(torch.cat(parts, dim=1))
+            else:
+                guidance_tokens_list.append((proj_old, proj_new))
 
         return guidance_tokens_list, None, num_layers
 
@@ -502,12 +557,13 @@ class CJEPAPredictor(nn.Module):
         vlm_guidance_list: List[torch.Tensor],
         num_vlm_layers: int,
         num_cjepa_layers: int
-    ) -> List[torch.Tensor]:
+    ) -> List[Optional[Union[torch.Tensor, Tuple[torch.Tensor, Optional[torch.Tensor]]]]]:
         """
         Map VLM layers to C-JEPA layers.
 
-        Example: VLM has 4 layers [6, 12, 18, 24], C-JEPA has 6 layers
-        Strategy: repeat last VLM layer for remaining C-JEPA layers
+        Example: VLM has 4 layers [6, 12, 18, 24], C-JEPA has 6 layers.
+        Strategy: map available layers by index and leave remaining C-JEPA
+        layers unguided. This matches ThinkJEPA's no-repeat behavior.
 
         Args:
             vlm_guidance_list: List of [B, S, D] tensors (one per VLM layer)
@@ -515,17 +571,18 @@ class CJEPAPredictor(nn.Module):
             num_cjepa_layers: Number of C-JEPA layers (e.g., 6)
 
         Returns:
-            List of [B, S, D] tensors (one per C-JEPA layer)
+            List with one entry per C-JEPA layer. Entries are guidance tokens
+            for guided layers and None for unguided layers.
         """
         if num_vlm_layers >= num_cjepa_layers:
-            # More VLM layers than C-JEPA: use first N
+            # More VLM layers than C-JEPA: use first N.
             return vlm_guidance_list[:num_cjepa_layers]
-        else:
-            # Fewer VLM layers: repeat last layer for remaining
-            result = vlm_guidance_list.copy()
-            for _ in range(num_cjepa_layers - num_vlm_layers):
-                result.append(vlm_guidance_list[-1])  # Repeat last VLM layer
-            return result
+
+        # ThinkJEPA-style behavior: if fewer VLM layers are available, do not
+        # repeat the final VLM layer. Later C-JEPA layers run unguided.
+        result = vlm_guidance_list.copy()
+        result.extend([None] * (num_cjepa_layers - num_vlm_layers))
+        return result
 
     @torch.no_grad()
     def inference(

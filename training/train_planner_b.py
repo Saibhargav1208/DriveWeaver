@@ -42,8 +42,14 @@ class PlannerTrainerB:
         print("\n=== Ablation 2: C-JEPA + VLM → Planner ===")
 
         vlm_cfg = cfg.vlm_guidance
-        self.vlm_random_dim = vlm_cfg.get('vlm_dim', None) if vlm_cfg.get('use_random', False) else None
-        self.vlm_random_tokens = vlm_cfg.get('random_tokens', 480)
+        self.use_vlm_guidance = bool(vlm_cfg.get('enable', False))
+        self.vlm_cache_dir = vlm_cfg.get('cache_dir', None) if self.use_vlm_guidance else None
+        self.vlm_random_dim = (
+            vlm_cfg.get('vlm_dim', None)
+            if self.use_vlm_guidance and vlm_cfg.get('use_random', False) else None
+        )
+        self.vlm_random_tokens_old = vlm_cfg.get('random_tokens_old', vlm_cfg.get('random_tokens', 480))
+        self.vlm_random_tokens_new = vlm_cfg.get('random_tokens_new', 16)
 
         # Build pipeline (with VLM guidance)
         self.pipeline = create_complete_pipeline(
@@ -76,6 +82,10 @@ class PlannerTrainerB:
             future_length=cfg.model.future_length,
             stride=cfg.data.stride,
             num_workers=cfg.data.num_workers,
+            vlm_cache_dir=self.vlm_cache_dir,
+            vlm_random_dim=self.vlm_random_dim,
+            vlm_random_tokens_old=self.vlm_random_tokens_old,
+            vlm_random_tokens_new=self.vlm_random_tokens_new,
         )
 
         # Loss
@@ -113,11 +123,18 @@ class PlannerTrainerB:
         torch.cuda.manual_seed_all(seed)
         np.random.seed(seed)
 
-    def _get_vlm_guidance(self, batch_size: int) -> Optional[Dict[str, torch.Tensor]]:
-        if self.vlm_random_dim:
-            features = torch.randn(batch_size, self.vlm_random_tokens, self.vlm_random_dim, device=self.device)
-            return {'vlm_features': features}
-        return None
+    def _build_vlm_guidance(self, batch: Dict) -> Optional[Dict[str, torch.Tensor]]:
+        if not self.use_vlm_guidance or 'vlm_features' not in batch:
+            return None
+
+        vlm_features = batch['vlm_features']
+        if isinstance(vlm_features, dict):
+            result = {}
+            for key, tensor in vlm_features.items():
+                result[key] = tensor.to(self.device) if tensor is not None else None
+            return result
+
+        return {'old': vlm_features.to(self.device).unsqueeze(1), 'new': None}
 
     def train_epoch(self) -> Dict[str, float]:
         self.pipeline.planner.train()
@@ -130,8 +147,7 @@ class PlannerTrainerB:
             history = batch['history_slots'].to(self.device)
             ego = batch['ego_history'].to(self.device)
             gt_traj = batch['ego_future_trajectory'].to(self.device)
-            B = history.shape[0]
-            vlm_guidance = self._get_vlm_guidance(B)
+            vlm_guidance = self._build_vlm_guidance(batch)
 
             with autocast(enabled=self.use_amp):
                 result = self.pipeline(history, ego, vlm_guidance=vlm_guidance, return_intermediates=True)
@@ -171,8 +187,7 @@ class PlannerTrainerB:
             history = batch['history_slots'].to(self.device)
             ego = batch['ego_history'].to(self.device)
             gt_traj = batch['ego_future_trajectory'].to(self.device)
-            B = history.shape[0]
-            vlm_guidance = self._get_vlm_guidance(B)
+            vlm_guidance = self._build_vlm_guidance(batch)
 
             result = self.pipeline(history, ego, vlm_guidance=vlm_guidance, return_intermediates=True)
             proposals = result['trajectory_proposals']

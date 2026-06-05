@@ -27,7 +27,7 @@ from models.complete_pipeline import DriveWeaverPipeline
 from models.cjepa_predictor import CJEPAPredictor
 from models.thinkjepa import ThinkJEPA
 from models.planner import Planner
-from datasets.planner_dataset import DriveJEPADataset
+from datasets.planner_dataset import DriveJEPADataset, collate_fn as planner_collate_fn
 from torch.utils.data import DataLoader
 
 
@@ -129,17 +129,16 @@ def main():
 
     print(f"\n✓ Pipeline loaded successfully!")
 
-    # Load data (NOTE: Not loading VLM features for inference since world model was trained with them)
+    # Load data with cached VLM features so Planner B matches C-JEPA+VLM training.
     print(f"\nLoading val data from {args.slots_path}...")
+    print(f"VLM cache: {args.vlm_cache_dir}")
     val_dataset = DriveJEPADataset(
         slots_path=args.slots_path,
-        split='val',
+        split=args.split,
         history_length=4,
         future_length=6,
+        vlm_cache_dir=args.vlm_cache_dir,
     )
-
-    # Import collate function
-    from datasets.planner_dataset import collate_fn as planner_collate_fn
 
     val_loader = DataLoader(
         val_dataset,
@@ -149,6 +148,14 @@ def main():
         pin_memory=True,
         collate_fn=planner_collate_fn,
     )
+
+    def build_vlm_guidance(batch: Dict) -> Optional[Dict[str, torch.Tensor]]:
+        if 'vlm_features' not in batch:
+            return None
+        return {
+            key: tensor.to(device) if tensor is not None else None
+            for key, tensor in batch['vlm_features'].items()
+        }
 
     # Run inference
     print(f"\n{'='*70}")
@@ -173,8 +180,10 @@ def main():
         ego = batch['ego_history'].to(device)
         gt_traj = batch['ego_future_trajectory'].to(device)
 
-        # Forward with all proposals (no VLM features at inference time)
-        result = pipeline(history, ego, vlm_guidance=None, return_intermediates=True)
+        vlm_guidance = build_vlm_guidance(batch)
+
+        # Forward with all proposals and the same cached VLM guidance used by Ablation 2.
+        result = pipeline(history, ego, vlm_guidance=vlm_guidance, return_intermediates=True)
         proposals = result['trajectory_proposals']  # [B, M, T, 2]
         scores = result['proposal_scores']  # [B, M]
 

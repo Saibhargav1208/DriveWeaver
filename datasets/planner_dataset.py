@@ -49,6 +49,10 @@ class DriveJEPADataset(Dataset):
         history_length: int = 4,
         future_length: int = 6,
         stride: int = 1,
+        vlm_cache_dir: Optional[str] = None,
+        vlm_random_dim: Optional[int] = None,
+        vlm_random_tokens_old: int = 480,
+        vlm_random_tokens_new: int = 16,
     ):
         """
         Args:
@@ -64,6 +68,10 @@ class DriveJEPADataset(Dataset):
         self.future_length = future_length
         self.stride = stride
         self.window_size = history_length + future_length
+        self.vlm_random_dim = vlm_random_dim
+        self.vlm_random_tokens_old = vlm_random_tokens_old
+        self.vlm_random_tokens_new = vlm_random_tokens_new
+        self.vlm_cache_required = bool(vlm_cache_dir) and vlm_random_dim is None
 
         # Load slots
         print(f"Loading slots from {slots_path}...")
@@ -75,6 +83,11 @@ class DriveJEPADataset(Dataset):
 
         self.split_data = data[split]
         self.scene_tokens = list(self.split_data.keys())
+
+        # Optional per-scene VLM cache for C-JEPA+VLM planner training/inference.
+        self.vlm_cache = {}
+        if vlm_cache_dir:
+            self._load_vlm_cache_index(vlm_cache_dir)
 
         # Build index: (scene_idx, start_idx) for each valid window
         self.index = []
@@ -88,6 +101,17 @@ class DriveJEPADataset(Dataset):
                 self.index.append((scene_idx, start_idx))
 
         print(f"  {split} split: {len(self.scene_tokens)} scenes, {len(self.index)} windows")
+
+    def _load_vlm_cache_index(self, vlm_cache_dir: str):
+        """Build scene_name -> VLM cache path index."""
+        cache_dir = Path(vlm_cache_dir)
+        if not cache_dir.exists():
+            raise FileNotFoundError(f"VLM cache dir not found: {cache_dir}")
+
+        for npz_path in cache_dir.glob("*.npz"):
+            self.vlm_cache[npz_path.stem] = npz_path
+
+        print(f"  VLM cache: indexed {len(self.vlm_cache)} scenes from {cache_dir}")
 
     def __len__(self) -> int:
         return len(self.index)
@@ -144,7 +168,47 @@ class DriveJEPADataset(Dataset):
             'start_idx': start_idx,
         }
 
+        vlm_features = self._get_vlm_features(scene_token)
+        if vlm_features is not None:
+            sample['vlm_features'] = vlm_features
+
         return sample
+
+    def _get_vlm_features(self, scene_token: str) -> Optional[Dict[str, torch.Tensor]]:
+        """
+        Load cached dual-path VLM features for a scene.
+
+        Returns:
+            dict with:
+                old: [num_layers, S_old, D]
+                new: [num_layers, S_new, D] or None
+        """
+        if scene_token in self.vlm_cache:
+            npz = np.load(self.vlm_cache[scene_token])
+
+            if 'vlm_old' in npz and 'vlm_new' in npz:
+                vlm_old = torch.from_numpy(npz['vlm_old'].astype(np.float32).copy())
+                vlm_new_arr = npz['vlm_new']
+                vlm_new = (
+                    torch.from_numpy(vlm_new_arr.astype(np.float32).copy())
+                    if vlm_new_arr.size > 0 else None
+                )
+                return {'old': vlm_old, 'new': vlm_new}
+
+            if 'vlm_features' in npz:
+                features = torch.from_numpy(npz['vlm_features'].astype(np.float32).copy())
+                return {'old': features.unsqueeze(0), 'new': None}
+
+        if self.vlm_random_dim is not None:
+            num_layers = 4
+            vlm_old = torch.randn(num_layers, self.vlm_random_tokens_old, self.vlm_random_dim)
+            vlm_new = torch.randn(num_layers, self.vlm_random_tokens_new, self.vlm_random_dim)
+            return {'old': vlm_old, 'new': vlm_new}
+
+        if self.vlm_cache_required:
+            raise FileNotFoundError(f"Missing VLM cache file for scene: {scene_token}")
+
+        return None
 
 
 def collate_fn(batch):
@@ -161,7 +225,7 @@ def collate_fn(batch):
     scene_tokens = [item['scene_token'] for item in batch]
     start_indices = [item['start_idx'] for item in batch]
 
-    return {
+    result = {
         'history_slots': history_slots,             # [B, T_hist, N, D]
         'future_slots_gt': future_slots_gt,         # [B, T_fut, N, D]
         'ego_history': ego_history,                 # [B, T_hist, 4]
@@ -169,6 +233,15 @@ def collate_fn(batch):
         'scene_tokens': scene_tokens,
         'start_indices': start_indices,
     }
+
+    if 'vlm_features' in batch[0] and batch[0]['vlm_features'] is not None:
+        features = [item['vlm_features'] for item in batch]
+        old = torch.stack([item['old'] for item in features])
+        new_items = [item['new'] for item in features]
+        new = torch.stack(new_items) if all(item is not None for item in new_items) else None
+        result['vlm_features'] = {'old': old, 'new': new}
+
+    return result
 
 
 def create_planner_dataloaders(
@@ -178,6 +251,10 @@ def create_planner_dataloaders(
     future_length: int = 6,
     stride: int = 1,
     num_workers: int = 4,
+    vlm_cache_dir: Optional[str] = None,
+    vlm_random_dim: Optional[int] = None,
+    vlm_random_tokens_old: int = 480,
+    vlm_random_tokens_new: int = 16,
 ) -> Tuple[DataLoader, DataLoader]:
     """
     Create train and val dataloaders for Drive-JEPA.
@@ -201,6 +278,10 @@ def create_planner_dataloaders(
         history_length=history_length,
         future_length=future_length,
         stride=stride,
+        vlm_cache_dir=vlm_cache_dir,
+        vlm_random_dim=vlm_random_dim,
+        vlm_random_tokens_old=vlm_random_tokens_old,
+        vlm_random_tokens_new=vlm_random_tokens_new,
     )
 
     train_loader = DataLoader(
@@ -220,6 +301,10 @@ def create_planner_dataloaders(
         history_length=history_length,
         future_length=future_length,
         stride=stride,
+        vlm_cache_dir=vlm_cache_dir,
+        vlm_random_dim=vlm_random_dim,
+        vlm_random_tokens_old=vlm_random_tokens_old,
+        vlm_random_tokens_new=vlm_random_tokens_new,
     )
 
     val_loader = DataLoader(

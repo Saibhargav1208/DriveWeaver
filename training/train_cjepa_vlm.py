@@ -136,7 +136,20 @@ class CJEPAWithVLMTrainer:
     def _build_vlm_guidance(self, batch: Dict) -> Optional[Dict[str, torch.Tensor]]:
         if 'vlm_features' not in batch:
             return None
-        return {'vlm_features': batch['vlm_features'].to(self.device)}
+
+        vlm_features = batch['vlm_features']
+        if isinstance(vlm_features, dict):
+            # Dual-path VLM (old + new)
+            result = {}
+            for key, tensor in vlm_features.items():
+                if tensor is not None:
+                    result[key] = tensor.to(self.device)
+                else:
+                    result[key] = None
+            return result
+        else:
+            # Legacy single tensor
+            return {'vlm_features': vlm_features.to(self.device)}
 
     def train_epoch(self) -> Dict[str, float]:
         self.model.train()
@@ -162,18 +175,32 @@ class CJEPAWithVLMTrainer:
                 pred_future = out[:, T_hist:, :, :]
                 loss = F.mse_loss(pred_future, future_gt)
 
+            # Check for NaN loss before backward pass
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"\n  WARNING: NaN/Inf loss detected at step {self.global_step}, skipping batch")
+                continue
+
             self.optimizer.zero_grad()
             if self.use_amp:
                 self.scaler.scale(loss).backward()
                 if self.cfg.training.gradient_clip > 0:
                     self.scaler.unscale_(self.optimizer)
-                    nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.training.gradient_clip)
+                    grad_norm = nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.training.gradient_clip)
+                    # Check for NaN gradients
+                    if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                        print(f"\n  WARNING: NaN/Inf gradients detected at step {self.global_step}, skipping batch")
+                        self.scaler.update()
+                        continue
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
                 loss.backward()
                 if self.cfg.training.gradient_clip > 0:
-                    nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.training.gradient_clip)
+                    grad_norm = nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.training.gradient_clip)
+                    # Check for NaN gradients
+                    if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                        print(f"\n  WARNING: NaN/Inf gradients detected at step {self.global_step}, skipping batch")
+                        continue
                 self.optimizer.step()
 
             if self.scheduler:

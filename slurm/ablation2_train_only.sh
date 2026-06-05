@@ -1,10 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=abl2_vlm
-#SBATCH --output=/data1/work/j0987341/aadya/research/DriveWeaver/logs/ablation2-%j.out
-#SBATCH --error=/data1/work/j0987341/aadya/research/DriveWeaver/logs/ablation2-%j.err
-#SBATCH --cpus-per-task=8
+#SBATCH --job-name=abl2_train
+#SBATCH --output=/data1/work/j0987341/aadya/research/DriveWeaver/logs/ablation2_train-%j.out
+#SBATCH --error=/data1/work/j0987341/aadya/research/DriveWeaver/logs/ablation2_train-%j.err
+#SBATCH --cpus-per-task=12
 #SBATCH --mem=64G
-#SBATCH --time=48:00:00
+#SBATCH --time=72:00:00
 #SBATCH --gres=gpu:nvidia_h100_nvl:1
 #SBATCH --partition=h100
 #SBATCH --signal=B:TERM@5
@@ -17,32 +17,12 @@ set -x
 ########################################
 
 CONTAINER=aadya_driveweaver
-
 WORKDIR=/work
 
-SCRIPT_VLM=scripts/cache_vlm_nuscenes_corrected.py
-VLM_ARGS=(
-  --slots_path /work/data/slots/nuscenes_slots_full.pkl
-  --output_dir /work/data/vlm_cache/nuscenes/
-  --nuscenes_root /data/nuScenes
-  --model_name Qwen/Qwen3-VL-2B-Thinking
-  --layers 6 12 18 24
-  --num_keyframes 16
-  --resolution 384
-  --max_new_tokens 16
-  --save_dtype fp16
-  --prompt "Describe what will happen next."
-)
+# VLM cache already exists - skip extraction!
+VLM_CACHE_DIR=/work/data/vlm_cache/nuscenes
 
-VLM_FALLBACK_ARGS=(
-  --slots_path /work/data/slots/nuscenes_slots_full.pkl
-  --output_dir /work/data/vlm_cache/nuscenes/
-  --lite
-  --lite_dim 2048
-  --lite_tokens_old 480
-  --lite_tokens_new 16
-)
-
+# Stage 1: C-JEPA + VLM World Model
 SCRIPT1=training/train_cjepa_vlm.py
 CONFIG1=default
 
@@ -50,15 +30,13 @@ TRAIN_ARGS1=(
   --config-name "${CONFIG1}"
 )
 
+# Stage 2: Planner B (with VLM-enhanced world model)
 SCRIPT2=training/train_planner_b.py
 CONFIG2=default
 
 TRAIN_ARGS2=(
   --config-name "${CONFIG2}"
 )
-########################################
-# python '${SCRIPT}' ${TRAIN_ARGS[*]}
-########################################
 
 RESTART_CONTAINER_ON_EXIT="true"
 
@@ -134,31 +112,51 @@ docker ps | grep "${CONTAINER}"
 docker exec "${CONTAINER}" pwd
 
 ########################################
-# Training
+# Pre-Flight Checks
 ########################################
 
-log_section "Training started"
+log_section "Pre-flight checks"
 
-echo ""
-echo "========================================"
-echo "Step 1: VLM Cache Verification"
-echo "========================================"
-
-# VLM cache already complete (850 scenes), skip extraction
-VLM_COUNT=$(docker exec "${CONTAINER}" bash -c "ls ${WORKDIR}/data/vlm_cache/nuscenes/*.npz 2>/dev/null | wc -l")
-echo "VLM cache files found: ${VLM_COUNT}"
+echo "Checking VLM cache..."
+VLM_COUNT=$(docker exec "${CONTAINER}" bash -c "ls ${VLM_CACHE_DIR}/*.npz 2>/dev/null | wc -l")
+echo "VLM cache files: ${VLM_COUNT}"
 
 if [ "${VLM_COUNT}" -lt 850 ]; then
-    echo "ERROR: VLM cache incomplete (${VLM_COUNT}/850)"
+    echo "ERROR: VLM cache incomplete (found ${VLM_COUNT}/850)"
     exit 1
 fi
 
-echo "✓ VLM cache complete, skipping extraction"
+echo "✓ VLM cache complete (${VLM_COUNT} scenes)"
+
+echo ""
+echo "Checking slots data..."
+docker exec "${CONTAINER}" bash -c "ls -lh /work/data/slots/nuscenes_slots_full.pkl"
+echo "✓ Slots data ready"
+
+echo ""
+echo "Checking C-JEPA checkpoint (for world model initialization)..."
+CJEPA_CKPT=$(docker exec "${CONTAINER}" bash -c "ls /work/checkpoints/cjepa/best_model.pth 2>/dev/null || echo 'NOT_FOUND'")
+if [ "${CJEPA_CKPT}" == "NOT_FOUND" ]; then
+    echo "WARNING: No C-JEPA checkpoint found - will train from scratch"
+else
+    echo "✓ C-JEPA checkpoint ready"
+fi
+
+########################################
+# Ablation 2 Training Pipeline
+########################################
+
+log_section "Ablation 2: C-JEPA+VLM → Planner B"
 
 echo ""
 echo "========================================"
-echo "Step 2: Training C-JEPA + VLM World Model"
+echo "STAGE 1/2: Training C-JEPA + VLM World Model"
 echo "========================================"
+echo "Duration: ~24-36 hours"
+echo "Epochs: 50"
+echo "Input: slots (850 scenes) + VLM cache (850 scenes)"
+echo "Output: /work/checkpoints/cjepa_vlm/best_model.pth"
+echo ""
 
 docker exec \
   -e NVIDIA_VISIBLE_DEVICES="${VISIBLE_UUIDS}" \
@@ -174,19 +172,34 @@ docker exec \
     echo 'CUDA_VISIBLE_DEVICES='\"\${CUDA_VISIBLE_DEVICES}\"
 
     export CUDA_VISIBLE_DEVICES=${VISIBLE_UUIDS}
+
+    echo ''
+    echo 'Starting C-JEPA + VLM training...'
+    echo ''
 
     PYTHONPATH=${WORKDIR} python '${SCRIPT1}' ${TRAIN_ARGS1[*]}
   "
 
-if [ $? -ne 0 ]; then
-    echo "ERROR: C-JEPA + VLM training failed!"
+STAGE1_EXIT=$?
+
+if [ ${STAGE1_EXIT} -ne 0 ]; then
+    echo "ERROR: C-JEPA + VLM training failed with exit code ${STAGE1_EXIT}"
     exit 1
 fi
 
 echo ""
+echo "✓ Stage 1 complete!"
+echo ""
+
+echo ""
 echo "========================================"
-echo "Step 3: Training Planner (Ablation 2)"
+echo "STAGE 2/2: Training Planner B (VLM-enhanced)"
 echo "========================================"
+echo "Duration: ~12-24 hours"
+echo "Epochs: 100"
+echo "Input: C-JEPA+VLM world model + VLM cache"
+echo "Output: /work/checkpoints/planner_b/best_model.pth"
+echo ""
 
 docker exec \
   -e NVIDIA_VISIBLE_DEVICES="${VISIBLE_UUIDS}" \
@@ -203,25 +216,46 @@ docker exec \
 
     export CUDA_VISIBLE_DEVICES=${VISIBLE_UUIDS}
 
+    echo ''
+    echo 'Starting Planner B training...'
+    echo ''
+
     PYTHONPATH=${WORKDIR} python '${SCRIPT2}' ${TRAIN_ARGS2[*]}
   "
 
-if [ $? -ne 0 ]; then
-    echo "ERROR: Planner training failed!"
+STAGE2_EXIT=$?
+
+if [ ${STAGE2_EXIT} -ne 0 ]; then
+    echo "ERROR: Planner B training failed with exit code ${STAGE2_EXIT}"
     exit 1
 fi
 
 echo ""
-echo "========================================"
-echo "Ablation 2 Complete!"
-echo "End: $(date)"
-echo "========================================"
-echo "Checkpoints:"
-echo "  VLM cache:    /work/data/vlm_cache/nuscenes/"
-echo "  World model:  /work/checkpoints/cjepa_vlm/best_model.pth"
-echo "  Planner:      /work/checkpoints/planner_b/best_model.pth"
+echo "✓ Stage 2 complete!"
+echo ""
 
-EXIT_CODE=$?
+########################################
+# Summary
+########################################
+
+log_section "Ablation 2 Training Complete!"
+
+echo "Duration: $(date)"
+echo ""
+echo "Pipeline: videosaur slots → C-JEPA+VLM → Planner B"
+echo ""
+echo "Checkpoints saved:"
+echo "  ✓ VLM cache:    ${VLM_CACHE_DIR}/ (850 scenes, 29GB)"
+echo "  ✓ World model:  /work/checkpoints/cjepa_vlm/best_model.pth"
+echo "  ✓ Planner:      /work/checkpoints/planner_b/best_model.pth"
+echo ""
+echo "Next steps:"
+echo "  1. Evaluate world model: python evaluation/rollout.py --model cjepa_vlm"
+echo "  2. Evaluate planner: python scripts/inference_planner_b.py"
+echo "  3. Compare with Ablation 1 (baseline C-JEPA)"
+echo ""
+
+EXIT_CODE=0
 
 trap - TERM INT EXIT
 cleanup

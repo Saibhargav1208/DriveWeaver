@@ -268,13 +268,15 @@ def main():
     pipeline.to(device).eval()
     print("  Pipeline ready!")
 
-    # Load data (no VLM at inference)
+    # Load data with cached VLM features so visualizations match Planner B inference.
     print("\nLoading validation data...")
+    print(f"VLM cache: {args.vlm_cache_dir}")
     val_dataset = DriveJEPADataset(
         slots_path=args.slots_path,
         split='val',
         history_length=4,
         future_length=6,
+        vlm_cache_dir=args.vlm_cache_dir,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -305,6 +307,14 @@ def main():
         sample_indices = list(range(min(args.num_samples, total_val_samples)))
         print(f"\nVisualizing first {args.num_samples} samples...")
 
+    def build_single_vlm_guidance(batch_data: Dict) -> Dict[str, torch.Tensor] | None:
+        if 'vlm_features' not in batch_data:
+            return None
+        result = {}
+        for key, tensor in batch_data['vlm_features'].items():
+            result[key] = tensor.unsqueeze(0).to(device) if tensor is not None else None
+        return result
+
     # Run inference
     print(f"Visualizing on images with ORACLE selection...")
     all_metrics = []
@@ -320,8 +330,10 @@ def main():
         scene_token = batch_data['scene_token']
         start_idx = batch_data['start_idx']
 
-        # Forward pass with ALL proposals (no VLM at inference)
-        out = pipeline(history_slots, ego_state=ego_history, vlm_guidance=None, return_intermediates=True)
+        vlm_guidance = build_single_vlm_guidance(batch_data)
+
+        # Forward pass with ALL proposals and cached VLM guidance.
+        out = pipeline(history_slots, ego_state=ego_history, vlm_guidance=vlm_guidance, return_intermediates=True)
         proposals = out['trajectory_proposals']  # [1, 32, 6, 2]
 
         # ORACLE SELECTION: Pick best by ADE
