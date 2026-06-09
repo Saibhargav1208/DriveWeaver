@@ -1,0 +1,25 @@
+name: qwen3_vl_2b_thinking
+model_name: Qwen/Qwen3-VL-2B-Thinking
+status: active
+
+cache:
+  extractor: scripts/cache_vlm_nuscenes_corrected.py
+  feature_schema: dual_path
+  old_key: vlm_old
+  new_key: vlm_new
+  save_dtype: fp16
+
+features:
+  hidden_dim: 2048
+  hooked_module: model.model.language_model.layers
+  hooked_layers: [6, 12, 18, 24]
+  guidance_mode: film
+  guidance_hidden: 512
+
+prompt:
+  text: Describe what will happen next.
+  max_new_tokens: 16
+
+images:
+  num_keyframes: 16
+  resolution: 384

@@ -1,0 +1,32 @@
+name: nuscenes_ablation1_cjepa
+dataset_config: configs/datasets/nuscenes.yaml
+vlm_config: null
+
+ablation:
+  name: ablation1
+  description: C-JEPA without VLM guidance
+  use_vlm_guidance: false
+
+world_model:
+  train_script: training/train_cjepa.py
+  config: configs/cjepa/default.yaml
+  checkpoint: /work/checkpoints/cjepa/best_model.pth
+  future_slots_cache_dir: /work/data/future_slots/cjepa
+
+planner:
+  train_script: training/train_planner_a.py
+  config: configs/planner_a/default.yaml
+  checkpoint: /work/checkpoints/planner_a/best_model.pth
+  output_dir: /work/outputs/planner_a_scoreloss_inference
+  selection: proposal_scores_argmax
+  oracle_script: scripts/inference_planner_a_oracle.py
+  scorer_script: scripts/inference_planner_a.py
+
+metrics:
+  report:
+    - scorer_ADE
+    - scorer_FDE
+    - scorer_MR_2m
+    - oracle_ADE
+    - oracle_FDE
+    - oracle_MR_2m

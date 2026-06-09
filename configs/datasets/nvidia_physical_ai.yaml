@@ -1,0 +1,31 @@
+name: nvidia_physical_ai
+display_name: NVIDIA Physical AI
+adapter: datasets.nvidia_physical_ai_dataset.NvidiaPhysicalAIDataset
+status: planned
+
+raw:
+  root: /work/data/nvidia_physical_ai
+  version: null
+  camera: CAM_FRONT
+
+slots:
+  path: /work/data/slots/nvidia_physical_ai_slots_full.pkl
+  num_slots: 11
+  slot_dim: 128
+  source: videosaur
+
+windows:
+  history_length: 4
+  future_length: 6
+  stride: 1
+
+artifacts:
+  vlm_cache_dir: /work/data/vlm_cache/nvidia_physical_ai
+  future_slots_cjepa_dir: /work/data/future_slots/nvidia_physical_ai_cjepa
+  future_slots_cjepa_vlm_dir: /work/data/future_slots/nvidia_physical_ai_cjepa_vlm
+  checkpoint_root: /work/checkpoints/nvidia_physical_ai
+  output_root: /work/outputs/nvidia_physical_ai
+
+notes:
+  - Adapter is not implemented yet.
+  - First implementation target should convert dataset trajectories into ego-relative windows matching planner supervision.

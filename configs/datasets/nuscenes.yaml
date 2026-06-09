@@ -1,0 +1,27 @@
+name: nuscenes
+display_name: nuScenes
+adapter: datasets.nuscenes_dataset.NuScenesVideoDataset
+
+raw:
+  root: /data/nuScenes
+  version: v1.0-trainval
+  camera: CAM_FRONT
+  n_val_scenes: 150
+
+slots:
+  path: /work/data/slots/nuscenes_slots_full.pkl
+  num_slots: 11
+  slot_dim: 128
+  source: videosaur
+
+windows:
+  history_length: 4
+  future_length: 6
+  stride: 1
+
+artifacts:
+  vlm_cache_dir: /work/data/vlm_cache/nuscenes
+  future_slots_cjepa_dir: /work/data/future_slots/cjepa
+  future_slots_cjepa_vlm_dir: /work/data/future_slots/cjepa_vlm
+  checkpoint_root: /work/checkpoints
+  output_root: /work/outputs

@@ -1,0 +1,25 @@
+name: replace_me
+model_name: replace/provider-model
+status: planned
+
+cache:
+  extractor: scripts/cache_vlm_nuscenes_corrected.py
+  feature_schema: dual_path
+  old_key: vlm_old
+  new_key: vlm_new
+  save_dtype: fp16
+
+features:
+  hidden_dim: null
+  hooked_module: null
+  hooked_layers: []
+  guidance_mode: film
+  guidance_hidden: 512
+
+prompt:
+  text: Describe what will happen next.
+  max_new_tokens: 16
+
+images:
+  num_keyframes: 16
+  resolution: 384

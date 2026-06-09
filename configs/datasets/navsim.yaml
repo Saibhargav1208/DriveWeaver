@@ -1,0 +1,31 @@
+name: navsim
+display_name: NAVSIM
+adapter: datasets.navsim_dataset.NavSimDataset
+status: planned
+
+raw:
+  root: /work/data/navsim
+  version: null
+  camera: CAM_FRONT
+
+slots:
+  path: /work/data/slots/navsim_slots_full.pkl
+  num_slots: 11
+  slot_dim: 128
+  source: videosaur
+
+windows:
+  history_length: 4
+  future_length: 6
+  stride: 1
+
+artifacts:
+  vlm_cache_dir: /work/data/vlm_cache/navsim
+  future_slots_cjepa_dir: /work/data/future_slots/navsim_cjepa
+  future_slots_cjepa_vlm_dir: /work/data/future_slots/navsim_cjepa_vlm
+  checkpoint_root: /work/checkpoints/navsim
+  output_root: /work/outputs/navsim
+
+notes:
+  - Adapter is not implemented yet.
+  - First implementation target should convert NAVSIM scenes into the standard slot-cache pickle schema.

@@ -1,0 +1,23 @@
+name: navsim_ablation1_cjepa
+dataset_config: configs/datasets/navsim.yaml
+vlm_config: null
+
+ablation:
+  name: ablation1
+  description: C-JEPA without VLM guidance on NAVSIM
+  use_vlm_guidance: false
+
+world_model:
+  train_script: training/train_cjepa.py
+  config: configs/cjepa/default.yaml
+  checkpoint: /work/checkpoints/navsim/cjepa/best_model.pth
+  future_slots_cache_dir: /work/data/future_slots/navsim_cjepa
+
+planner:
+  train_script: training/train_planner_a.py
+  config: configs/planner_a/default.yaml
+  checkpoint: /work/checkpoints/navsim/planner_a/best_model.pth
+  output_dir: /work/outputs/navsim/planner_a_scoreloss_inference
+  selection: proposal_scores_argmax
+
+status: planned

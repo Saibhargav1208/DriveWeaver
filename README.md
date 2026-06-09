@@ -28,6 +28,32 @@ nuScenes frames + prompt
   -> injected into C-JEPA layers during world-model prediction
 ```
 
+
+## Experiment Organization
+
+The codebase now has a lightweight experiment-spec layer for running the same ablation hypothesis across datasets and VLMs:
+
+```text
+configs/datasets/      # nuScenes, NAVSIM, NVIDIA Physical AI dataset specs
+configs/vlms/          # VLM cache/extractor specs
+configs/experiments/   # full dataset x ablation x VLM experiment specs
+experiments/registry.py
+```
+
+See:
+
+```text
+docs/CODEBASE_ORGANIZATION.md
+docs/EXPERIMENT_MATRIX.md
+```
+
+List or inspect experiment specs with:
+
+```bash
+PYTHONPATH=/work python -m experiments.registry --list
+PYTHONPATH=/work python -m experiments.registry configs/experiments/nuscenes_ablation2_cjepa_vlm_qwen3.yaml
+```
+
 ## Data And Artifacts
 
 Expected paths inside the Docker container:
