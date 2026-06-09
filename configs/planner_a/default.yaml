@@ -35,7 +35,7 @@ loss:
   lambda_ade: 1.0
   lambda_fde: 0.5
   lambda_wta: 0.5
-  lambda_diversity: 0.1
+  lambda_diversity: 0.02
   lambda_smoothness: 0.1
   lambda_feasibility: 0.05
   diversity_sigma: 1.0
@@ -43,6 +43,10 @@ loss:
   max_speed: 15.0
   max_accel: 4.0
   dt: 0.5
+  lambda_score_ce: 1.0
+  lambda_score_kl: 0.0
+  score_temperature: 0.5
+  lambda_all_ade: 0.05
 
 checkpoints:
   cjepa: /work/checkpoints/cjepa/best_model.pth

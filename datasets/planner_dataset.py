@@ -244,6 +244,110 @@ def collate_fn(batch):
     return result
 
 
+class CachedFutureSlotsDataset(Dataset):
+    """
+    Planner dataset backed by precomputed C-JEPA/ThinkJEPA future slots.
+
+    This is the fast path for planner-only training: the frozen world model and
+    VLM guidance have already been run offline, so each sample only needs the
+    cached future slots, ego history, and ground-truth ego future trajectory.
+    """
+
+    def __init__(self, cache_path: str):
+        super().__init__()
+        self.cache_path = Path(cache_path)
+        if not self.cache_path.exists():
+            raise FileNotFoundError(f"Future-slot cache not found: {self.cache_path}")
+
+        print(f"Loading precomputed future slots from {self.cache_path}...")
+        cache = torch.load(self.cache_path, map_location='cpu', weights_only=False)
+
+        required = ['future_slots', 'ego_history', 'ego_future_trajectory']
+        missing = [key for key in required if key not in cache]
+        if missing:
+            raise KeyError(f"Missing keys in {self.cache_path}: {missing}")
+
+        self.future_slots = cache['future_slots']
+        self.ego_history = cache['ego_history']
+        self.ego_future_trajectory = cache['ego_future_trajectory']
+        self.scene_tokens = cache.get('scene_tokens', ['unknown'] * len(self.future_slots))
+        self.start_indices = cache.get('start_indices', torch.zeros(len(self.future_slots), dtype=torch.long))
+        self.metadata = cache.get('metadata', {})
+
+        n = len(self.future_slots)
+        if len(self.ego_history) != n or len(self.ego_future_trajectory) != n:
+            raise ValueError("Cached tensor lengths do not match")
+
+        print(f"  Cached samples: {n}")
+        print(f"  Future slots: {tuple(self.future_slots.shape)} {self.future_slots.dtype}")
+
+    def __len__(self) -> int:
+        return len(self.future_slots)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        start_idx = self.start_indices[idx]
+        if isinstance(start_idx, torch.Tensor):
+            start_idx = int(start_idx.item())
+
+        return {
+            'future_slots': self.future_slots[idx],
+            'ego_history': self.ego_history[idx].float(),
+            'ego_future_trajectory': self.ego_future_trajectory[idx].float(),
+            'scene_token': self.scene_tokens[idx],
+            'start_idx': start_idx,
+        }
+
+
+def cached_collate_fn(batch):
+    """Collate precomputed future-slot samples."""
+    return {
+        'future_slots': torch.stack([item['future_slots'] for item in batch]),
+        'ego_history': torch.stack([item['ego_history'] for item in batch]),
+        'ego_future_trajectory': torch.stack([item['ego_future_trajectory'] for item in batch]),
+        'scene_tokens': [item['scene_token'] for item in batch],
+        'start_indices': [item['start_idx'] for item in batch],
+    }
+
+
+def create_cached_planner_dataloaders(
+    cache_dir: str,
+    batch_size: int = 16,
+    num_workers: int = 4,
+) -> Tuple[DataLoader, DataLoader]:
+    """Create train/val dataloaders from precomputed future-slot cache files."""
+    cache_dir_path = Path(cache_dir)
+    train_dataset = CachedFutureSlotsDataset(str(cache_dir_path / 'train.pt'))
+    val_dataset = CachedFutureSlotsDataset(str(cache_dir_path / 'val.pt'))
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        collate_fn=cached_collate_fn,
+        pin_memory=True,
+        drop_last=True,
+        persistent_workers=num_workers > 0,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=cached_collate_fn,
+        pin_memory=True,
+        drop_last=False,
+        persistent_workers=num_workers > 0,
+    )
+
+    print(f"\nCached DataLoaders created:")
+    print(f"  Train: {len(train_dataset)} samples, {len(train_loader)} batches")
+    print(f"  Val:   {len(val_dataset)} samples, {len(val_loader)} batches")
+
+    return train_loader, val_loader
+
+
 def create_planner_dataloaders(
     slots_path: str,
     batch_size: int = 16,

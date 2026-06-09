@@ -23,8 +23,9 @@ from typing import Dict
 
 sys.path.append(str(Path(__file__).parent.parent))
 
-from datasets.planner_dataset import create_planner_dataloaders
+from datasets.planner_dataset import create_planner_dataloaders, create_cached_planner_dataloaders
 from models.complete_pipeline import create_complete_pipeline, DriveWeaverPipeline
+from models.planner import create_planner
 from training.losses_planner import PlannerLoss
 
 
@@ -40,37 +41,72 @@ class PlannerTrainerA:
 
         print("\n=== Ablation 1: C-JEPA → Planner ===")
 
-        # Build pipeline (no VLM guidance)
-        self.pipeline = create_complete_pipeline(
-            slot_dim=cfg.model.slot_dim,
-            num_slots=cfg.model.num_slots,
-            history_len=cfg.model.history_length,
-            future_len=cfg.model.future_length,
-            num_modes=cfg.model.num_modes,
-            cjepa_depth=cfg.model.cjepa_depth,
-            cjepa_heads=cfg.model.cjepa_heads,
-            cjepa_mlp_dim=cfg.model.cjepa_mlp_dim,
-            guidance_mode=None,
-            guidance_dim=None,
-            planner_decoder_layers=cfg.model.planner_decoder_layers,
-            planner_heads=cfg.model.planner_heads,
-            cjepa_checkpoint=cfg.checkpoints.get('cjepa', None),
-            device=str(self.device),
-        )
+        self.use_cached_future_slots = bool(cfg.data.get('future_slots_cache_dir', None))
+        self.pipeline = None
 
-        # Freeze world model
-        self.pipeline.freeze_world_model()
-        self.pipeline.print_parameter_summary()
+        if self.use_cached_future_slots:
+            print(f"\nUsing precomputed C-JEPA future slots: {cfg.data.future_slots_cache_dir}")
+            self.planner = create_planner(
+                slot_dim=cfg.model.slot_dim,
+                num_slots=cfg.model.num_slots,
+                num_modes=cfg.model.num_modes,
+                future_len=cfg.model.future_length,
+                history_len=cfg.model.history_length,
+                num_decoder_layers=cfg.model.planner_decoder_layers,
+                num_heads=cfg.model.planner_heads,
+            ).to(self.device)
 
-        # Data
-        self.train_loader, self.val_loader = create_planner_dataloaders(
-            slots_path=cfg.data.slots_path,
-            batch_size=cfg.data.batch_size,
-            history_length=cfg.model.history_length,
-            future_length=cfg.model.future_length,
-            stride=cfg.data.stride,
-            num_workers=cfg.data.num_workers,
-        )
+            planner_ckpt = cfg.checkpoints.get('planner', None)
+            if planner_ckpt and Path(planner_ckpt).exists():
+                print(f"  Loading planner: {planner_ckpt}")
+                ckpt = torch.load(planner_ckpt, map_location='cpu', weights_only=False)
+                state = ckpt.get('model_state_dict', ckpt)
+                self.planner.load_state_dict(state, strict=False)
+
+            total = sum(p.numel() for p in self.planner.parameters())
+            trainable = sum(p.numel() for p in self.planner.parameters() if p.requires_grad)
+            print(f"\n=== Planner Parameters ===")
+            print(f"Trainable: {trainable:,}")
+            print(f"Total:     {total:,}")
+
+            self.train_loader, self.val_loader = create_cached_planner_dataloaders(
+                cache_dir=cfg.data.future_slots_cache_dir,
+                batch_size=cfg.data.batch_size,
+                num_workers=cfg.data.num_workers,
+            )
+        else:
+            # Build pipeline (no VLM guidance)
+            self.pipeline = create_complete_pipeline(
+                slot_dim=cfg.model.slot_dim,
+                num_slots=cfg.model.num_slots,
+                history_len=cfg.model.history_length,
+                future_len=cfg.model.future_length,
+                num_modes=cfg.model.num_modes,
+                cjepa_depth=cfg.model.cjepa_depth,
+                cjepa_heads=cfg.model.cjepa_heads,
+                cjepa_mlp_dim=cfg.model.cjepa_mlp_dim,
+                guidance_mode=None,
+                guidance_dim=None,
+                planner_decoder_layers=cfg.model.planner_decoder_layers,
+                planner_heads=cfg.model.planner_heads,
+                cjepa_checkpoint=cfg.checkpoints.get('cjepa', None),
+                device=str(self.device),
+            )
+
+            # Freeze world model
+            self.pipeline.freeze_world_model()
+            self.pipeline.print_parameter_summary()
+            self.planner = self.pipeline.planner
+
+            # Data
+            self.train_loader, self.val_loader = create_planner_dataloaders(
+                slots_path=cfg.data.slots_path,
+                batch_size=cfg.data.batch_size,
+                history_length=cfg.model.history_length,
+                future_length=cfg.model.future_length,
+                stride=cfg.data.stride,
+                num_workers=cfg.data.num_workers,
+            )
 
         # Loss
         self.criterion = PlannerLoss(
@@ -85,16 +121,20 @@ class PlannerTrainerA:
             max_speed=cfg.loss.max_speed,
             max_accel=cfg.loss.max_accel,
             dt=cfg.loss.dt,
+            lambda_score_ce=cfg.loss.get('lambda_score_ce', 1.0),
+            lambda_score_kl=cfg.loss.get('lambda_score_kl', 0.0),
+            score_temperature=cfg.loss.get('score_temperature', 0.5),
+            lambda_all_ade=cfg.loss.get('lambda_all_ade', 0.05),
         )
 
         # Optimizer (planner only)
-        planner_params = [p for p in self.pipeline.planner.parameters() if p.requires_grad]
+        planner_params = [p for p in self.planner.parameters() if p.requires_grad]
         self.optimizer = torch.optim.AdamW(
             planner_params, lr=cfg.training.learning_rate, weight_decay=cfg.training.weight_decay,
         )
         print(f"\n  Optimizer: {sum(p.numel() for p in planner_params):,} planner params @ LR={cfg.training.learning_rate}")
 
-        self.use_amp = cfg.training.mixed_precision
+        self.use_amp = bool(cfg.training.mixed_precision and self.device.type == 'cuda')
         self.scaler = GradScaler() if self.use_amp else None
         self.current_epoch = 0
         self.global_step = 0
@@ -107,33 +147,48 @@ class PlannerTrainerA:
         torch.cuda.manual_seed_all(seed)
         np.random.seed(seed)
 
+    def _forward_planner(self, batch: Dict):
+        ego = batch['ego_history'].to(self.device, non_blocking=True)
+        gt_traj = batch['ego_future_trajectory'].to(self.device, non_blocking=True)
+
+        if self.use_cached_future_slots:
+            future_slots = batch['future_slots'].to(self.device, non_blocking=True).float()
+            result = self.planner(
+                refined_slots=future_slots,
+                ego_state=ego,
+                return_all_proposals=True,
+            )
+        else:
+            history = batch['history_slots'].to(self.device, non_blocking=True)
+            result = self.pipeline(history, ego, vlm_guidance=None, return_intermediates=True)
+
+        return result, gt_traj
+
     def train_epoch(self) -> Dict[str, float]:
-        self.pipeline.planner.train()
-        self.pipeline.world_model.eval()
+        self.planner.train()
+        if self.pipeline is not None:
+            self.pipeline.world_model.eval()
         total_loss = 0.0
         metrics_sum = {}
         n = 0
 
         for batch in tqdm(self.train_loader, desc=f"Epoch {self.current_epoch} [train]"):
-            history = batch['history_slots'].to(self.device)
-            ego = batch['ego_history'].to(self.device)
-            gt_traj = batch['ego_future_trajectory'].to(self.device)
-
             with autocast(enabled=self.use_amp):
-                result = self.pipeline(history, ego, vlm_guidance=None, return_intermediates=True)
+                result, gt_traj = self._forward_planner(batch)
                 proposals = result['trajectory_proposals']
-                loss, metrics = self.criterion(proposals, gt_traj)
+                scores = result['proposal_scores']
+                loss, metrics = self.criterion(proposals, gt_traj, scores)
 
             self.optimizer.zero_grad()
             if self.use_amp:
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(self.optimizer)
-                nn.utils.clip_grad_norm_(self.pipeline.planner.parameters(), self.cfg.training.clip_grad_norm)
+                nn.utils.clip_grad_norm_(self.planner.parameters(), self.cfg.training.clip_grad_norm)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
                 loss.backward()
-                nn.utils.clip_grad_norm_(self.pipeline.planner.parameters(), self.cfg.training.clip_grad_norm)
+                nn.utils.clip_grad_norm_(self.planner.parameters(), self.cfg.training.clip_grad_norm)
                 self.optimizer.step()
 
             total_loss += loss.item()
@@ -148,19 +203,19 @@ class PlannerTrainerA:
 
     @torch.no_grad()
     def validate(self) -> Dict[str, float]:
-        self.pipeline.eval()
+        self.planner.eval()
+        if self.pipeline is not None:
+            self.pipeline.world_model.eval()
         total_loss = 0.0
         metrics_sum = {}
         n = 0
 
         for batch in tqdm(self.val_loader, desc=f"Epoch {self.current_epoch} [val] "):
-            history = batch['history_slots'].to(self.device)
-            ego = batch['ego_history'].to(self.device)
-            gt_traj = batch['ego_future_trajectory'].to(self.device)
-
-            result = self.pipeline(history, ego, vlm_guidance=None, return_intermediates=True)
-            proposals = result['trajectory_proposals']
-            loss, metrics = self.criterion(proposals, gt_traj)
+            with autocast(enabled=self.use_amp):
+                result, gt_traj = self._forward_planner(batch)
+                proposals = result['trajectory_proposals']
+                scores = result['proposal_scores']
+                loss, metrics = self.criterion(proposals, gt_traj, scores)
 
             total_loss += loss.item()
             for k, v in metrics.items():
@@ -174,9 +229,11 @@ class PlannerTrainerA:
     def save_checkpoint(self, epoch: int, is_best: bool = False):
         ckpt = {
             'epoch': epoch,
-            'model_state_dict': self.pipeline.planner.state_dict(),
+            'model_state_dict': self.planner.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'best_val_loss': self.best_val_loss,
+            'uses_score_loss': True,
+            'uses_cached_future_slots': self.use_cached_future_slots,
         }
         path = self.checkpoint_dir / f'checkpoint_epoch{epoch:04d}.pth'
         torch.save(ckpt, path)
@@ -216,8 +273,10 @@ class PlannerTrainerA:
 
             print(
                 f"Epoch {epoch:03d} | "
-                f"Train: loss={train_m['loss']:.2f} ADE={train_m.get('loss_minADE',0):.2f} | "
-                f"Val: loss={val_m['loss']:.2f} ADE={val_m.get('loss_minADE',0):.2f}"
+                f"Train: loss={train_m['loss']:.2f} ADE={train_m.get('loss_minADE',0):.2f} "
+                f"ScoreAcc={train_m.get('score_acc',0):.2f} Rank={train_m.get('score_avg_rank',0):.1f} | "
+                f"Val: loss={val_m['loss']:.2f} ADE={val_m.get('loss_minADE',0):.2f} "
+                f"ScoreAcc={val_m.get('score_acc',0):.2f} Rank={val_m.get('score_avg_rank',0):.1f}"
             )
 
             is_best = val_m['loss'] < self.best_val_loss

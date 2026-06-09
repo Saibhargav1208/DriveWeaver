@@ -272,28 +272,15 @@ def feasibility_loss(
 
 class PlannerLoss(nn.Module):
     """
-    Combined loss for Drive-JEPA multimodal trajectory planning.
+    Combined loss for multimodal trajectory planning.
 
-    L_total = λ_ade * minADE
-            + λ_fde * minFDE
-            + λ_wta * WTA
-            + λ_div * Diversity
-            + λ_smooth * Smoothness
-            + λ_feas * Feasibility
+    The trajectory terms train the proposal set. The score terms train the
+    proposal scorer so normal inference can select a proposal without GT.
 
-    Args:
-        lambda_ade: weight for minADE (primary metric)
-        lambda_fde: weight for minFDE
-        lambda_wta: weight for winner-takes-all
-        lambda_diversity: weight for diversity (negative loss)
-        lambda_smoothness: weight for smoothness
-        lambda_feasibility: weight for feasibility constraints
-
-        diversity_sigma: temperature for diversity loss
-        penalize_jerk: whether to penalize jerk (vs acceleration)
-        max_speed: maximum speed constraint (m/s)
-        max_accel: maximum acceleration constraint (m/s^2)
-        dt: time step between frames (s)
+    L_total = trajectory losses
+            + lambda_score_ce * CE(proposal_scores, argmin_ADE)
+            + lambda_score_kl * KL(softmax(scores), softmax(-ADE / tau))
+            + lambda_all_ade * mean_ADE_over_all_modes
     """
 
     def __init__(
@@ -309,6 +296,10 @@ class PlannerLoss(nn.Module):
         max_speed: float = 15.0,
         max_accel: float = 4.0,
         dt: float = 0.5,
+        lambda_score_ce: float = 1.0,
+        lambda_score_kl: float = 0.0,
+        score_temperature: float = 0.5,
+        lambda_all_ade: float = 0.05,
     ):
         super().__init__()
 
@@ -318,50 +309,67 @@ class PlannerLoss(nn.Module):
         self.lambda_diversity = lambda_diversity
         self.lambda_smoothness = lambda_smoothness
         self.lambda_feasibility = lambda_feasibility
+        self.lambda_score_ce = lambda_score_ce
+        self.lambda_score_kl = lambda_score_kl
+        self.lambda_all_ade = lambda_all_ade
 
         self.diversity_sigma = diversity_sigma
         self.penalize_jerk = penalize_jerk
         self.max_speed = max_speed
         self.max_accel = max_accel
         self.dt = dt
+        self.score_temperature = score_temperature
 
     def forward(
         self,
         predictions: torch.Tensor,    # [B, M, T, 2]
         targets: torch.Tensor,        # [B, T, 2]
+        proposal_scores: Optional[torch.Tensor] = None,  # [B, M]
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """
-        Compute combined loss.
+        """Compute combined proposal and proposal-selection loss."""
 
-        Returns:
-            total_loss: scalar
-            metrics: dict of individual loss components (for logging)
-        """
+        ade_per_proposal = compute_ade(predictions, targets)  # [B, M]
+        loss_ade, best_indices = ade_per_proposal.min(dim=1)
+        loss_ade = loss_ade.mean()
 
-        # 1. minADE (primary metric)
-        loss_ade, best_indices = compute_min_ade(predictions, targets)
+        fde_per_proposal = compute_fde(predictions, targets)  # [B, M]
+        loss_fde = fde_per_proposal.min(dim=1)[0].mean()
 
-        # 2. minFDE
-        loss_fde, _ = compute_min_fde(predictions, targets)
-
-        # 3. Winner-takes-all
         loss_wta = winner_takes_all_loss(predictions, targets, best_indices)
-
-        # 4. Diversity
         loss_div = diversity_loss(predictions, sigma=self.diversity_sigma)
-
-        # 5. Smoothness
         loss_smooth = smoothness_loss(predictions, penalize_jerk=self.penalize_jerk)
-
-        # 6. Feasibility
         loss_feas = feasibility_loss(
             predictions,
             max_speed=self.max_speed,
             max_accel=self.max_accel,
             dt=self.dt,
         )
+        loss_all_ade = ade_per_proposal.mean()
 
-        # Total loss
+        zero = predictions.new_tensor(0.0)
+        loss_score_ce = zero
+        loss_score_kl = zero
+        score_acc = zero
+        score_avg_rank = zero
+
+        if proposal_scores is not None:
+            best_indices_detached = best_indices.detach()
+            if self.lambda_score_ce > 0:
+                loss_score_ce = F.cross_entropy(proposal_scores, best_indices_detached)
+
+            if self.lambda_score_kl > 0:
+                tau = max(float(self.score_temperature), 1e-6)
+                target_probs = F.softmax(-ade_per_proposal.detach() / tau, dim=1)
+                score_log_probs = F.log_softmax(proposal_scores, dim=1)
+                loss_score_kl = F.kl_div(score_log_probs, target_probs, reduction='batchmean')
+
+            selected_indices = proposal_scores.argmax(dim=1)
+            score_acc = (selected_indices == best_indices_detached).float().mean()
+            sorted_by_ade = torch.argsort(ade_per_proposal.detach(), dim=1)
+            rank_matches = (sorted_by_ade == selected_indices.unsqueeze(1)).nonzero(as_tuple=False)
+            if rank_matches.numel() > 0:
+                score_avg_rank = (rank_matches[:, 1].float() + 1.0).mean()
+
         total_loss = (
             self.lambda_ade * loss_ade
             + self.lambda_fde * loss_fde
@@ -369,9 +377,11 @@ class PlannerLoss(nn.Module):
             + self.lambda_diversity * loss_div
             + self.lambda_smoothness * loss_smooth
             + self.lambda_feasibility * loss_feas
+            + self.lambda_score_ce * loss_score_ce
+            + self.lambda_score_kl * loss_score_kl
+            + self.lambda_all_ade * loss_all_ade
         )
 
-        # Metrics for logging
         metrics = {
             'loss_total': total_loss.item(),
             'loss_minADE': loss_ade.item(),
@@ -380,10 +390,14 @@ class PlannerLoss(nn.Module):
             'loss_diversity': loss_div.item(),
             'loss_smoothness': loss_smooth.item(),
             'loss_feasibility': loss_feas.item(),
+            'loss_score_ce': loss_score_ce.item(),
+            'loss_score_kl': loss_score_kl.item(),
+            'loss_allADE': loss_all_ade.item(),
+            'score_acc': score_acc.item(),
+            'score_avg_rank': score_avg_rank.item(),
         }
 
         return total_loss, metrics
-
 
 def compute_trajectory_metrics(
     predictions: torch.Tensor,    # [B, M, T, 2]
